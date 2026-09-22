@@ -1,0 +1,8 @@
+Metadata-Version: 2.4
+Name: self-healing-api-adapter
+Version: 0.1.0
+Summary: Autonomous self-healing API compatibility agent
+Requires-Python: >=3.12
+Requires-Dist: chromadb
+Requires-Dist: openai>=1.0.0
+Requires-Dist: google-genai
