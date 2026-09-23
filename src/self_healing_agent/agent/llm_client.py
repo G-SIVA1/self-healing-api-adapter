@@ -144,7 +144,7 @@ class GeminiTransport:
 
 
 class AsyncLLMClient:
-    """Provider-independent LLM client."""
+    """Provider-independent asynchronous LLM client."""
 
     def __init__(
         self,
@@ -152,7 +152,7 @@ class AsyncLLMClient:
         model: str,
         timeout_seconds: float = 30.0,
         max_retries: int = 2,
-        base_delay_seconds: float = 0.5,
+        base_delay_seconds: float = 2.0,
     ) -> None:
         if not model.strip():
             raise ValueError(
@@ -210,6 +210,15 @@ class AsyncLLMClient:
 
                 if attempt >= self._max_retries:
                     raise last_error from exc
+
+            except LLMRequestError as exc:
+                last_error = exc
+
+                if attempt >= self._max_retries:
+                    raise LLMRequestError(
+                        "LLM request failed after "
+                        f"{self._max_retries + 1} attempts"
+                    ) from exc
 
             except Exception as exc:
                 last_error = exc

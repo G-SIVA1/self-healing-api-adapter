@@ -12,6 +12,8 @@ from self_healing_agent.agent.response_parser import (
 
 
 class RepairReasoner(Protocol):
+    """Interface for generating repair reasoning."""
+
     async def reason(
         self,
         context: ReasoningContext,
@@ -20,7 +22,7 @@ class RepairReasoner(Protocol):
 
 
 class LLMClient(Protocol):
-    """Provider-independent interface for an LLM client."""
+    """Interface for asynchronous LLM clients."""
 
     async def generate(
         self,
@@ -29,8 +31,94 @@ class LLMClient(Protocol):
         ...
 
 
+class DeterministicRepairReasoner:
+    """
+    Deterministic repair reasoner.
+
+    This implementation performs the known Stripe Customer
+    API migration without requiring an external LLM.
+    """
+
+    async def reason(
+        self,
+        context: ReasoningContext,
+    ) -> RepairReasoning:
+        source_code = context.current_source_code
+
+        if source_code is None:
+            raise ValueError(
+                "Current source code is required"
+            )
+
+        if not source_code.strip():
+            raise ValueError(
+                "Current source code cannot be empty"
+            )
+
+        if context.api_call is None:
+            raise ValueError(
+                "API call is required"
+            )
+
+        if not context.api_call.strip():
+            raise ValueError(
+                "API call cannot be empty"
+            )
+
+        if not context.target_file:
+            raise ValueError(
+                "Target file is required"
+            )
+
+        legacy_api = "stripe.Customer.create"
+        current_api = "stripe.customers.create"
+
+        if legacy_api not in source_code:
+            raise ValueError(
+                "Deprecated API call was not found "
+                "in current source code"
+            )
+
+        replacement_code = source_code.replace(
+            legacy_api,
+            current_api,
+            1,
+        )
+
+        if replacement_code == source_code:
+            raise ValueError(
+                "Repair did not modify the source code"
+            )
+
+        explanation = (
+            "The deprecated API "
+            "'stripe.Customer.create' was replaced "
+            "with the current "
+            "'stripe.customers.create' API."
+        )
+
+        patch = CodePatch(
+            file_path=context.target_file,
+            original_code=source_code,
+            replacement_code=replacement_code,
+            explanation=explanation,
+        )
+
+        return RepairReasoning(
+            explanation=explanation,
+            confidence=0.95,
+            patch=patch,
+        )
+
+
 class LLMRepairReasoner:
-    """LLM-backed implementation of the repair reasoner."""
+    """
+    Generate source-code repairs using an LLM.
+
+    The LLM is responsible for producing a complete corrected
+    source file. The response parser validates the generated
+    repair before it is returned to the agent loop.
+    """
 
     def __init__(
         self,
@@ -46,102 +134,43 @@ class LLMRepairReasoner:
         self,
         context: ReasoningContext,
     ) -> RepairReasoning:
-        if context.current_source_code is None:
+        source_code = context.current_source_code
+
+        if source_code is None:
             raise ValueError(
-                "Current source code is required for reasoning"
+                "Current source code is required"
             )
 
-        if context.target_file is None:
+        if not source_code.strip():
             raise ValueError(
-                "Target file is required for reasoning"
+                "Current source code cannot be empty"
             )
 
-        prompt = self._prompt_builder.build(context)
+        if not context.target_file:
+            raise ValueError(
+                "Target file is required"
+            )
 
-        response = await self._client.generate(prompt)
+        if context.api_call is None:
+            raise ValueError(
+                "API call is required"
+            )
+
+        if not context.api_call.strip():
+            raise ValueError(
+                "API call cannot be empty"
+            )
+
+        prompt = self._prompt_builder.build(
+            context
+        )
+
+        response = await self._client.generate(
+            prompt
+        )
 
         return self._response_parser.parse(
             response=response,
             target_file=context.target_file,
-            original_code=context.current_source_code,
-        )
-
-
-class DeterministicRepairReasoner:
-    """
-    Deterministic repair implementation.
-
-    This implements the same asynchronous interface as the
-    future LLM-backed reasoner.
-    """
-
-    async def reason(
-        self,
-        context: ReasoningContext,
-    ) -> RepairReasoning:
-        if context.current_source_code is None:
-            raise ValueError(
-                "Current source code is required for reasoning"
-            )
-
-        original_api = context.api_call
-
-        if original_api is None:
-            raise ValueError(
-                "API call is required for reasoning"
-            )
-
-        suggested_api = self._find_suggested_api(
-            context.documentation,
-        )
-
-        if suggested_api is None:
-            raise ValueError(
-                "No supported replacement API was found "
-                "in the documentation"
-            )
-
-        source_code = context.current_source_code
-
-        if original_api not in source_code:
-            raise ValueError(
-                "Original API call was not found "
-                "in current source code"
-            )
-
-        replacement_code = source_code.replace(
-            original_api,
-            suggested_api,
-            1,
-        )
-
-        patch = CodePatch(
-            file_path=(
-                context.target_file
-                if context.target_file is not None
-                else ""
-            ),
             original_code=source_code,
-            replacement_code=replacement_code,
-            explanation=(
-                f"Replace deprecated API "
-                f"'{original_api}' with "
-                f"'{suggested_api}' according to "
-                "the retrieved documentation."
-            ),
         )
-
-        return RepairReasoning(
-            explanation=patch.explanation,
-            confidence=0.95,
-            patch=patch,
-        )
-
-    @staticmethod
-    def _find_suggested_api(
-        documentation: str,
-    ) -> str | None:
-        if "stripe.customers.create" in documentation:
-            return "stripe.customers.create"
-
-        return None

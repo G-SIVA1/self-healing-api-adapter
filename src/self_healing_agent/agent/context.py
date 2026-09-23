@@ -10,12 +10,14 @@ from self_healing_agent.agent.state import AgentState
 
 @dataclass(frozen=True, slots=True)
 class ReasoningContext:
-    """Context supplied to the repair reasoning component."""
+    """
+    Immutable reasoning context supplied to a repair reasoner.
+    """
 
     error_message: str
     exception_type: str
 
-    target_file: str | None
+    target_file: str
     target_line: int | None
     function_name: str | None
 
@@ -27,7 +29,6 @@ class ReasoningContext:
     documentation: str
 
     previous_generated_code: str | None
-
     test_output: str | None
 
     failure_analysis: FailureAnalysis | None
@@ -37,7 +38,9 @@ class ReasoningContext:
 
 
 class ReasoningContextBuilder:
-    """Build structured reasoning context from AgentState."""
+    """
+    Build a reasoning context from the current agent state.
+    """
 
     def build(
         self,
@@ -45,32 +48,24 @@ class ReasoningContextBuilder:
         current_source_code: str | None = None,
     ) -> ReasoningContext:
         """
-        Build a complete reasoning context.
-
-        The context contains the runtime failure, relevant
-        documentation, current source code, previous repair
-        information, and validation feedback.
+        Build a complete reasoning context from AgentState.
         """
 
-        event = state.error_event
+        error_event = state.error_event
 
-        documentation = self._build_documentation(
-            state,
+        documentation = self._format_documentation(
+            state.documentation,
         )
 
         return ReasoningContext(
-            error_message=event.message,
-            exception_type=event.exception_type,
-            target_file=event.file_path,
-            target_line=event.line_number,
-            function_name=event.function_name,
-            api_service=event.api_service,
-            api_call=event.api_call,
-            current_source_code=current_source_code
-            if current_source_code is not None
-            else state.generated_code
-            if state.generated_code is not None
-            else state.original_code,
+            error_message=error_event.message,
+            exception_type=error_event.exception_type,
+            target_file=error_event.file_path or "",
+            target_line=error_event.line_number,
+            function_name=error_event.function_name,
+            api_service=error_event.api_service,
+            api_call=error_event.api_call,
+            current_source_code=current_source_code,
             documentation=documentation,
             previous_generated_code=state.generated_code,
             test_output=state.test_output,
@@ -80,23 +75,55 @@ class ReasoningContextBuilder:
         )
 
     @staticmethod
-    def _build_documentation(
-        state: AgentState,
+    def _format_documentation(
+        documentation: list[object],
     ) -> str:
-        """Combine retrieved documentation chunks."""
+        """
+        Convert retrieved documentation chunks into one
+        prompt-ready string.
+        """
 
-        if not state.documentation:
-            return ""
+        if not documentation:
+            return "No documentation available."
 
-        sections: list[str] = []
+        formatted_chunks: list[str] = []
 
         for index, chunk in enumerate(
-            state.documentation,
+            documentation,
             start=1,
         ):
-            sections.append(
-                f"Documentation Source {index}:\n"
-                f"{chunk.content}"
+            content = getattr(
+                chunk,
+                "content",
+                None,
             )
 
-        return "\n\n".join(sections)
+            if content is None:
+                content = str(chunk)
+
+            source = getattr(
+                chunk,
+                "source",
+                None,
+            )
+
+            chunk_index = getattr(
+                chunk,
+                "chunk_index",
+                None,
+            )
+
+            if source is not None:
+                formatted_chunks.append(
+                    f"[Document {index}]\n"
+                    f"Source: {source}\n"
+                    f"Chunk: {chunk_index}\n"
+                    f"{content}"
+                )
+            else:
+                formatted_chunks.append(
+                    f"[Document {index}]\n"
+                    f"{content}"
+                )
+
+        return "\n\n".join(formatted_chunks)
