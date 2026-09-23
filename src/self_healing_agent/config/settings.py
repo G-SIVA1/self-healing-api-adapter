@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 class SettingsError(Exception):
@@ -16,6 +16,9 @@ class Settings:
     llm_model: str
     llm_timeout_seconds: float
     llm_max_retries: int
+    llm_fallback_models: tuple[str, ...] = field(
+        default_factory=tuple,
+    )
 
     @classmethod
     def from_environment(cls) -> Settings:
@@ -28,6 +31,11 @@ class Settings:
 
         model = os.getenv(
             "LLM_MODEL",
+            "",
+        ).strip()
+
+        fallback_models_raw = os.getenv(
+            "LLM_FALLBACK_MODELS",
             "",
         ).strip()
 
@@ -50,6 +58,18 @@ class Settings:
             raise SettingsError(
                 "LLM_MODEL cannot be empty"
             )
+
+        fallback_models: tuple[str, ...] = tuple(
+            model_name.strip()
+            for model_name in fallback_models_raw.split(",")
+            if model_name.strip()
+        )
+
+        fallback_models = tuple(
+            model_name
+            for model_name in fallback_models
+            if model_name != model
+        )
 
         try:
             timeout_seconds = float(timeout_raw)
@@ -80,4 +100,5 @@ class Settings:
             llm_model=model,
             llm_timeout_seconds=timeout_seconds,
             llm_max_retries=max_retries,
+            llm_fallback_models=fallback_models,
         )

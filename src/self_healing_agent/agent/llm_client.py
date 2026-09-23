@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from typing import Protocol
 
 from google import genai
@@ -13,35 +14,34 @@ class LLMClientError(Exception):
 
 
 class LLMTimeoutError(LLMClientError):
-    """Raised when an LLM request times out."""
+    """Raised when an LLM request exceeds the configured timeout."""
 
 
 class LLMRequestError(LLMClientError):
-    """Raised when an LLM request fails."""
+    """Raised when an LLM provider request fails."""
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderError:
+    """Normalized provider error information."""
+
+    status_code: int | None
+    message: str
+    retryable: bool
+    fallback_allowed: bool
 
 
 class LLMTransport(Protocol):
-    """Low-level asynchronous transport used by the LLM client."""
-
-    async def send(
-        self,
-        prompt: str,
-        model: str,
-    ) -> str:
-        ...
+    async def send(self, prompt: str, model: str) -> str:
+        """Send a prompt to an LLM provider."""
 
 
 class OpenAITransport:
-    """OpenAI implementation of the LLM transport."""
+    """Async transport for OpenAI's Responses API."""
 
-    def __init__(
-        self,
-        api_key: str | None = None,
-    ) -> None:
+    def __init__(self, api_key: str | None = None) -> None:
         if api_key is not None and not api_key.strip():
-            raise ValueError(
-                "api_key cannot be empty"
-            )
+            raise ValueError("api_key cannot be empty")
 
         self._client = AsyncOpenAI(
             api_key=api_key,
@@ -54,14 +54,10 @@ class OpenAITransport:
         model: str,
     ) -> str:
         if not prompt.strip():
-            raise ValueError(
-                "prompt cannot be empty"
-            )
+            raise ValueError("prompt cannot be empty")
 
         if not model.strip():
-            raise ValueError(
-                "model cannot be empty"
-            )
+            raise ValueError("model cannot be empty")
 
         try:
             response = await self._client.responses.create(
@@ -70,7 +66,10 @@ class OpenAITransport:
             )
         except Exception as exc:
             raise LLMRequestError(
-                "OpenAI request failed"
+                self._format_provider_error(
+                    provider="OpenAI",
+                    error=exc,
+                )
             ) from exc
 
         output = response.output_text
@@ -82,18 +81,35 @@ class OpenAITransport:
 
         return output
 
+    @staticmethod
+    def _format_provider_error(
+        provider: str,
+        error: Exception,
+    ) -> str:
+        status_code = getattr(
+            error,
+            "status_code",
+            None,
+        )
+
+        if status_code is not None:
+            return (
+                f"{provider} request failed with HTTP "
+                f"{status_code}: {error}"
+            )
+
+        return f"{provider} request failed: {error}"
+
 
 class GeminiTransport:
-    """Google Gemini implementation of the LLM transport."""
+    """Async transport for Google's Gemini API."""
 
     def __init__(
         self,
         api_key: str | None = None,
     ) -> None:
         if api_key is not None and not api_key.strip():
-            raise ValueError(
-                "api_key cannot be empty"
-            )
+            raise ValueError("api_key cannot be empty")
 
         try:
             self._client = genai.Client(
@@ -101,7 +117,7 @@ class GeminiTransport:
             )
         except Exception as exc:
             raise LLMRequestError(
-                "Unable to initialize Gemini client"
+                f"Unable to initialize Gemini client: {exc}"
             ) from exc
 
     async def send(
@@ -110,14 +126,10 @@ class GeminiTransport:
         model: str,
     ) -> str:
         if not prompt.strip():
-            raise ValueError(
-                "prompt cannot be empty"
-            )
+            raise ValueError("prompt cannot be empty")
 
         if not model.strip():
-            raise ValueError(
-                "model cannot be empty"
-            )
+            raise ValueError("model cannot be empty")
 
         try:
             response = await asyncio.to_thread(
@@ -129,22 +141,133 @@ class GeminiTransport:
                 ),
             )
         except Exception as exc:
+            provider_error = self._classify_error(exc)
+
             raise LLMRequestError(
-                "Gemini request failed"
+                self._format_error(
+                    model=model,
+                    provider_error=provider_error,
+                )
             ) from exc
 
         output = response.text
 
         if not output or not output.strip():
             raise LLMRequestError(
-                "Gemini returned an empty response"
+                f"Gemini model '{model}' returned "
+                "an empty response"
             )
 
         return output
 
+    @classmethod
+    def _classify_error(
+        cls,
+        error: Exception,
+    ) -> ProviderError:
+        status_code = cls._extract_status_code(error)
+        message = str(error).strip()
+
+        if status_code in {
+            408,
+            429,
+            500,
+            502,
+            503,
+            504,
+        }:
+            return ProviderError(
+                status_code=status_code,
+                message=message,
+                retryable=True,
+                fallback_allowed=True,
+            )
+
+        if status_code in {
+            400,
+            401,
+            403,
+            404,
+        }:
+            return ProviderError(
+                status_code=status_code,
+                message=message,
+                retryable=False,
+                fallback_allowed=status_code == 404,
+            )
+
+        return ProviderError(
+            status_code=status_code,
+            message=message,
+            retryable=True,
+            fallback_allowed=True,
+        )
+
+    @staticmethod
+    def _extract_status_code(
+        error: Exception,
+    ) -> int | None:
+        status_code = getattr(
+            error,
+            "status_code",
+            None,
+        )
+
+        if isinstance(status_code, int):
+            return status_code
+
+        response = getattr(
+            error,
+            "response",
+            None,
+        )
+
+        if response is not None:
+            response_status = getattr(
+                response,
+                "status_code",
+                None,
+            )
+
+            if isinstance(response_status, int):
+                return response_status
+
+        return None
+
+    @staticmethod
+    def _format_error(
+        model: str,
+        provider_error: ProviderError,
+    ) -> str:
+        if provider_error.status_code is not None:
+            status = (
+                f"HTTP {provider_error.status_code}"
+            )
+        else:
+            status = "unknown status"
+
+        return (
+            f"Gemini request failed for model "
+            f"'{model}' ({status}). "
+            f"Retryable={provider_error.retryable}, "
+            f"FallbackAllowed="
+            f"{provider_error.fallback_allowed}. "
+            f"Provider message: "
+            f"{provider_error.message}"
+        )
+
 
 class AsyncLLMClient:
-    """Provider-independent asynchronous LLM client."""
+    """
+    Resilient asynchronous LLM client.
+
+    Supports:
+    - request timeouts
+    - retry with exponential backoff
+    - model failover
+    - permanent error detection
+    - detailed provider errors
+    """
 
     def __init__(
         self,
@@ -153,11 +276,10 @@ class AsyncLLMClient:
         timeout_seconds: float = 30.0,
         max_retries: int = 2,
         base_delay_seconds: float = 2.0,
+        fallback_models: tuple[str, ...] = (),
     ) -> None:
         if not model.strip():
-            raise ValueError(
-                "model cannot be empty"
-            )
+            raise ValueError("model cannot be empty")
 
         if timeout_seconds <= 0:
             raise ValueError(
@@ -174,8 +296,19 @@ class AsyncLLMClient:
                 "base_delay_seconds cannot be negative"
             )
 
+        normalized_fallback_models = tuple(
+            fallback_model.strip()
+            for fallback_model in fallback_models
+            if fallback_model.strip()
+            and fallback_model.strip() != model
+        )
+
         self._transport = transport
         self._model = model
+        self._models = (
+            model,
+            *normalized_fallback_models,
+        )
         self._timeout_seconds = timeout_seconds
         self._max_retries = max_retries
         self._base_delay_seconds = base_delay_seconds
@@ -185,10 +318,55 @@ class AsyncLLMClient:
         prompt: str,
     ) -> str:
         if not prompt.strip():
-            raise ValueError(
-                "prompt cannot be empty"
-            )
+            raise ValueError("prompt cannot be empty")
 
+        has_fallback_models = len(self._models) > 1
+        failures: list[str] = []
+
+        for model in self._models:
+            try:
+                return await self._generate_with_model(
+                    prompt=prompt,
+                    model=model,
+                    allow_timeout_failover=has_fallback_models,
+                )
+
+            except LLMTimeoutError as exc:
+                if not has_fallback_models:
+                    raise
+
+                failures.append(
+                    f"{model}: {exc}"
+                )
+
+                continue
+
+            except LLMRequestError as exc:
+                if self._should_stop_for_error(exc):
+                    raise
+
+                failures.append(
+                    f"{model}: {exc}"
+                )
+
+                continue
+
+        failure_summary = "\n".join(
+            f"- {failure}"
+            for failure in failures
+        )
+
+        raise LLMRequestError(
+            "All configured LLM models failed.\n"
+            f"{failure_summary}"
+        )
+
+    async def _generate_with_model(
+        self,
+        prompt: str,
+        model: str,
+        allow_timeout_failover: bool,
+    ) -> str:
         last_error: Exception | None = None
 
         for attempt in range(
@@ -198,45 +376,119 @@ class AsyncLLMClient:
                 return await asyncio.wait_for(
                     self._transport.send(
                         prompt=prompt,
-                        model=self._model,
+                        model=model,
                     ),
                     timeout=self._timeout_seconds,
                 )
 
             except asyncio.TimeoutError as exc:
-                last_error = LLMTimeoutError(
-                    "LLM request timed out"
+                timeout_error = LLMTimeoutError(
+                    f"LLM request timed out for model "
+                    f"'{model}' after "
+                    f"{self._timeout_seconds:.1f} seconds"
                 )
 
+                last_error = timeout_error
+
                 if attempt >= self._max_retries:
-                    raise last_error from exc
+                    if allow_timeout_failover:
+                        raise timeout_error from exc
+
+                    raise timeout_error from exc
+
+                await self._sleep_before_retry(
+                    attempt=attempt,
+                )
 
             except LLMRequestError as exc:
                 last_error = exc
 
+                if not self._is_retryable_error(exc):
+                    raise
+
                 if attempt >= self._max_retries:
                     raise LLMRequestError(
-                        "LLM request failed after "
-                        f"{self._max_retries + 1} attempts"
+                        f"LLM request failed for model "
+                        f"'{model}' after "
+                        f"{self._max_retries + 1} attempts: "
+                        f"{exc}"
                     ) from exc
+
+                await self._sleep_before_retry(
+                    attempt=attempt,
+                )
 
             except Exception as exc:
                 last_error = exc
 
                 if attempt >= self._max_retries:
                     raise LLMRequestError(
-                        "LLM request failed after "
-                        f"{self._max_retries + 1} attempts"
+                        f"LLM request failed for model "
+                        f"'{model}' after "
+                        f"{self._max_retries + 1} attempts: "
+                        f"{exc}"
                     ) from exc
 
-            delay = (
-                self._base_delay_seconds
-                * (2**attempt)
-            )
-
-            if delay > 0:
-                await asyncio.sleep(delay)
+                await self._sleep_before_retry(
+                    attempt=attempt,
+                )
 
         raise LLMRequestError(
-            "LLM request failed unexpectedly"
+            f"LLM request failed unexpectedly for model "
+            f"'{model}'"
         ) from last_error
+
+    async def _sleep_before_retry(
+        self,
+        attempt: int,
+    ) -> None:
+        delay = self._calculate_backoff_delay(
+            attempt=attempt,
+        )
+
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    def _calculate_backoff_delay(
+        self,
+        attempt: int,
+    ) -> float:
+        return self._base_delay_seconds * (
+            2**attempt
+        )
+
+    @staticmethod
+    def _is_retryable_error(
+        error: LLMRequestError,
+    ) -> bool:
+        message = str(error)
+
+        if "Retryable=False" in message:
+            return False
+
+        return True
+
+    @staticmethod
+    def _should_stop_for_error(
+        error: LLMRequestError,
+    ) -> bool:
+        """
+        Stop immediately for errors that are not useful
+        to retry or hide behind another model.
+        """
+
+        message = str(error)
+
+        if "HTTP 400" in message:
+            return True
+
+        if "HTTP 401" in message:
+            return True
+
+        if "HTTP 403" in message:
+            return True
+
+        if "FallbackAllowed=False" in message:
+            return True
+
+        return False

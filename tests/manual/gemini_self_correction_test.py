@@ -158,6 +158,37 @@ inputs whenever possible.
     ]
 
 
+def load_model_configuration() -> tuple[
+    str,
+    tuple[str, ...],
+]:
+    """Load the primary and fallback Gemini models."""
+
+    primary_model = os.getenv(
+        "LLM_MODEL",
+        "gemini-2.5-flash",
+    ).strip()
+
+    if not primary_model:
+        raise RuntimeError(
+            "LLM_MODEL cannot be empty"
+        )
+
+    fallback_models_raw = os.getenv(
+        "LLM_FALLBACK_MODELS",
+        "",
+    )
+
+    fallback_models = tuple(
+        model.strip()
+        for model in fallback_models_raw.split(",")
+        if model.strip()
+        and model.strip() != primary_model
+    )
+
+    return primary_model, fallback_models
+
+
 async def main() -> None:
     """Run the real Gemini self-correction workflow."""
 
@@ -170,10 +201,23 @@ async def main() -> None:
             "GEMINI_API_KEY is not configured"
         )
 
-    model = os.getenv(
-        "LLM_MODEL",
-        "gemini-3.6-flash",
+    model, fallback_models = (
+        load_model_configuration()
     )
+
+    print(
+        f"Primary Gemini model: {model}"
+    )
+
+    if fallback_models:
+        print(
+            "Fallback Gemini models: "
+            + ", ".join(fallback_models)
+        )
+    else:
+        print(
+            "Fallback Gemini models: none"
+        )
 
     with TemporaryDirectory(
         prefix="self_healing_test_",
@@ -215,6 +259,7 @@ async def main() -> None:
             timeout_seconds=30,
             max_retries=2,
             base_delay_seconds=0.5,
+            fallback_models=fallback_models,
         )
 
         reasoner = LLMRepairReasoner(
