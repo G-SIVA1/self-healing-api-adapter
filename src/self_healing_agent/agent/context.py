@@ -2,32 +2,25 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from self_healing_agent.agent.failure_analyzer import (
-    FailureAnalysis,
-)
+from self_healing_agent.agent.failure_analyzer import FailureAnalysis
+from self_healing_agent.agent.history import RepairAttempt
 from self_healing_agent.agent.state import AgentState
 
 
 @dataclass(frozen=True, slots=True)
 class ReasoningContext:
-    """
-    Immutable reasoning context supplied to a repair reasoner.
-    """
+    """Immutable context supplied to a repair reasoner."""
 
     error_message: str
     exception_type: str
-
     target_file: str
     target_line: int | None
     function_name: str | None
-
     api_service: str | None
     api_call: str | None
 
     current_source_code: str | None
-
     documentation: str
-
     previous_generated_code: str | None
     test_output: str | None
 
@@ -36,25 +29,30 @@ class ReasoningContext:
     iteration: int
     max_iterations: int
 
+    historical_repairs: tuple[RepairAttempt, ...] = ()
+
 
 class ReasoningContextBuilder:
-    """
-    Build a reasoning context from the current agent state.
-    """
+    """Build the complete context required for repair reasoning."""
 
     def build(
         self,
         state: AgentState,
         current_source_code: str | None = None,
+        historical_repairs: list[RepairAttempt] | None = None,
     ) -> ReasoningContext:
-        """
-        Build a complete reasoning context from AgentState.
-        """
+        """Build a reasoning context from the current agent state."""
 
         error_event = state.error_event
 
         documentation = self._format_documentation(
-            state.documentation,
+            state.documentation
+        )
+
+        normalized_history = tuple(
+            historical_repairs
+            if historical_repairs is not None
+            else []
         )
 
         return ReasoningContext(
@@ -72,16 +70,14 @@ class ReasoningContextBuilder:
             failure_analysis=state.failure_analysis,
             iteration=state.iteration,
             max_iterations=state.max_iterations,
+            historical_repairs=normalized_history,
         )
 
     @staticmethod
     def _format_documentation(
         documentation: list[object],
     ) -> str:
-        """
-        Convert retrieved documentation chunks into one
-        prompt-ready string.
-        """
+        """Convert documentation chunks into readable context."""
 
         if not documentation:
             return "No documentation available."
@@ -127,3 +123,38 @@ class ReasoningContextBuilder:
                 )
 
         return "\n\n".join(formatted_chunks)
+
+    @staticmethod
+    def format_historical_repairs(
+        historical_repairs: tuple[RepairAttempt, ...],
+    ) -> str:
+        """Format previous repair attempts for an LLM prompt."""
+
+        if not historical_repairs:
+            return "No previous repair history available."
+
+        formatted_repairs: list[str] = []
+
+        for index, attempt in enumerate(
+            historical_repairs,
+            start=1,
+        ):
+            formatted_repairs.append(
+                f"[Historical Repair {index}]\n"
+                f"Iteration: {attempt.iteration}\n"
+                f"Target file: {attempt.target_file}\n"
+                f"Exception: {attempt.exception_type}\n"
+                f"Error: {attempt.error_message}\n"
+                f"Status: {attempt.status}\n"
+                f"Test passed: {attempt.test_passed}\n"
+                f"Confidence: {attempt.confidence}\n"
+                f"Explanation: {attempt.explanation}\n"
+                f"Original code:\n"
+                f"{attempt.original_code}\n"
+                f"Generated code:\n"
+                f"{attempt.generated_code}\n"
+                f"Test output:\n"
+                f"{attempt.test_output}"
+            )
+
+        return "\n\n".join(formatted_repairs)

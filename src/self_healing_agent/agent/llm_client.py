@@ -267,6 +267,7 @@ class AsyncLLMClient:
     - model failover
     - permanent error detection
     - detailed provider errors
+    - successful model provenance
     """
 
     def __init__(
@@ -312,6 +313,19 @@ class AsyncLLMClient:
         self._timeout_seconds = timeout_seconds
         self._max_retries = max_retries
         self._base_delay_seconds = base_delay_seconds
+        self._last_model: str | None = None
+
+    @property
+    def last_model(self) -> str | None:
+        """Return the model that produced the latest successful response."""
+
+        return self._last_model
+
+    @property
+    def configured_models(self) -> tuple[str, ...]:
+        """Return the primary model followed by fallback models."""
+
+        return self._models
 
     async def generate(
         self,
@@ -323,13 +337,19 @@ class AsyncLLMClient:
         has_fallback_models = len(self._models) > 1
         failures: list[str] = []
 
+        self._last_model = None
+
         for model in self._models:
             try:
-                return await self._generate_with_model(
+                response = await self._generate_with_model(
                     prompt=prompt,
                     model=model,
                     allow_timeout_failover=has_fallback_models,
                 )
+
+                self._last_model = model
+
+                return response
 
             except LLMTimeoutError as exc:
                 if not has_fallback_models:

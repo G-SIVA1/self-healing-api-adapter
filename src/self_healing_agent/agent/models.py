@@ -12,3 +12,4 @@ class RepairReasoning:
     explanation: str
     confidence: float
     patch: CodePatch
+    model: str | None = None

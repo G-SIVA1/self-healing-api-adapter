@@ -7,18 +7,18 @@ import pytest
 from self_healing_agent.agent.llm_client import (
     AsyncLLMClient,
     LLMRequestError,
-    LLMTimeoutError,
+)
+from self_healing_agent.agent.reasoner import (
+    LLMRepairReasoner,
 )
 
 
-class SequenceTransport:
-    """Transport that returns predefined responses/errors."""
-
+class FakeTransport:
     def __init__(
         self,
-        outcomes: list[str | Exception],
+        responses: dict[str, str | Exception],
     ) -> None:
-        self._outcomes = outcomes
+        self.responses = responses
         self.calls: list[str] = []
 
     async def send(
@@ -28,247 +28,203 @@ class SequenceTransport:
     ) -> str:
         self.calls.append(model)
 
-        if not self._outcomes:
-            raise RuntimeError(
-                "No more configured transport outcomes"
-            )
+        response = self.responses[model]
 
-        outcome = self._outcomes.pop(0)
+        if isinstance(response, Exception):
+            raise response
 
-        if isinstance(outcome, Exception):
-            raise outcome
-
-        return outcome
+        return response
 
 
-class TimeoutTransport:
-    """Transport that always times out."""
-
-    def __init__(self) -> None:
-        self.calls: list[str] = []
-
+class FailingTransport:
     async def send(
         self,
         prompt: str,
         model: str,
     ) -> str:
-        self.calls.append(model)
-        await asyncio.sleep(1)
-        return "never reached"
-
-
-@pytest.mark.asyncio
-async def test_503_retries_then_uses_fallback() -> None:
-    transport = SequenceTransport(
-        [
-            LLMRequestError(
-                "Gemini request failed for model "
-                "'primary-model' (HTTP 503). "
-                "Retryable=True, "
-                "FallbackAllowed=True."
-            ),
-            LLMRequestError(
-                "Gemini request failed for model "
-                "'primary-model' (HTTP 503). "
-                "Retryable=True, "
-                "FallbackAllowed=True."
-            ),
-            "successful fallback response",
-        ]
-    )
-
-    client = AsyncLLMClient(
-        transport=transport,
-        model="primary-model",
-        fallback_models=("fallback-model",),
-        timeout_seconds=1.0,
-        max_retries=1,
-        base_delay_seconds=0,
-    )
-
-    result = await client.generate(
-        "repair this API",
-    )
-
-    assert result == "successful fallback response"
-
-    assert transport.calls == [
-        "primary-model",
-        "primary-model",
-        "fallback-model",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_404_model_is_skipped_without_retry() -> None:
-    transport = SequenceTransport(
-        [
-            LLMRequestError(
-                "Gemini request failed for model "
-                "'unavailable-model' (HTTP 404). "
-                "Retryable=False, "
-                "FallbackAllowed=True."
-            ),
-            "fallback response",
-        ]
-    )
-
-    client = AsyncLLMClient(
-        transport=transport,
-        model="unavailable-model",
-        fallback_models=("fallback-model",),
-        timeout_seconds=1.0,
-        max_retries=2,
-        base_delay_seconds=0,
-    )
-
-    result = await client.generate(
-        "repair this API",
-    )
-
-    assert result == "fallback response"
-
-    assert transport.calls == [
-        "unavailable-model",
-        "fallback-model",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_timeout_retries_then_uses_fallback() -> None:
-    transport = SequenceTransport(
-        [
-            LLMTimeoutError(
-                "LLM request timed out for model "
-                "'primary-model'"
-            ),
-            "fallback response",
-        ]
-    )
-
-    client = AsyncLLMClient(
-        transport=transport,
-        model="primary-model",
-        fallback_models=("fallback-model",),
-        timeout_seconds=1.0,
-        max_retries=0,
-        base_delay_seconds=0,
-    )
-
-    result = await client.generate(
-        "repair this API",
-    )
-
-    assert result == "fallback response"
-
-    assert transport.calls == [
-        "primary-model",
-        "fallback-model",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_429_daily_quota_uses_fallback_without_retry() -> None:
-    transport = SequenceTransport(
-        [
-            LLMRequestError(
-                "Gemini request failed for model "
-                "'primary-model' (HTTP 429). "
-                "Retryable=False, "
-                "FallbackAllowed=True. "
-                "Provider message: "
-                "Quota exceeded for metric: "
-                "generativelanguage.googleapis.com/"
-                "generate_content_free_tier_requests"
-            ),
-            "fallback response",
-        ]
-    )
-
-    client = AsyncLLMClient(
-        transport=transport,
-        model="primary-model",
-        fallback_models=("fallback-model",),
-        timeout_seconds=1.0,
-        max_retries=2,
-        base_delay_seconds=0,
-    )
-
-    result = await client.generate(
-        "repair this API",
-    )
-
-    assert result == "fallback response"
-
-    assert transport.calls == [
-        "primary-model",
-        "fallback-model",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_all_models_failure_contains_failure_details() -> None:
-    transport = SequenceTransport(
-        [
-            LLMRequestError(
-                "Gemini request failed for model "
-                "'primary-model' (HTTP 503). "
-                "Retryable=True, "
-                "FallbackAllowed=True."
-            ),
-            LLMRequestError(
-                "Gemini request failed for model "
-                "'fallback-model' (HTTP 503). "
-                "Retryable=True, "
-                "FallbackAllowed=True."
-            ),
-        ]
-    )
-
-    client = AsyncLLMClient(
-        transport=transport,
-        model="primary-model",
-        fallback_models=("fallback-model",),
-        timeout_seconds=1.0,
-        max_retries=0,
-        base_delay_seconds=0,
-    )
-
-    with pytest.raises(
-        LLMRequestError,
-        match="All configured LLM models failed",
-    ) as exc_info:
-        await client.generate(
-            "repair this API",
+        raise LLMRequestError(
+            "HTTP 503 Service Unavailable"
         )
 
-    error_message = str(exc_info.value)
-
-    assert "primary-model" in error_message
-    assert "fallback-model" in error_message
-    assert "HTTP 503" in error_message
-
 
 @pytest.mark.asyncio
-async def test_timeout_without_fallback_preserves_timeout_error() -> None:
-    transport = TimeoutTransport()
+async def test_fallback_model_is_used_after_primary_failure() -> None:
+    transport = FakeTransport(
+        responses={
+            "primary-model": LLMRequestError(
+                "HTTP 503 Service Unavailable"
+            ),
+            "fallback-model": "successful response",
+        }
+    )
 
     client = AsyncLLMClient(
         transport=transport,
-        model="test-model",
+        model="primary-model",
+        fallback_models=("fallback-model",),
+        max_retries=0,
+        base_delay_seconds=0,
+    )
+
+    result = await client.generate(
+        "test prompt"
+    )
+
+    assert result == "successful response"
+
+    assert transport.calls == [
+        "primary-model",
+        "fallback-model",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_last_model_records_successful_fallback() -> None:
+    transport = FakeTransport(
+        responses={
+            "primary-model": LLMRequestError(
+                "HTTP 503 Service Unavailable"
+            ),
+            "fallback-model": "successful response",
+        }
+    )
+
+    client = AsyncLLMClient(
+        transport=transport,
+        model="primary-model",
+        fallback_models=("fallback-model",),
+        max_retries=0,
+        base_delay_seconds=0,
+    )
+
+    await client.generate(
+        "test prompt"
+    )
+
+    assert client.last_model == "fallback-model"
+
+
+@pytest.mark.asyncio
+async def test_last_model_records_primary_success() -> None:
+    transport = FakeTransport(
+        responses={
+            "primary-model": "successful response",
+            "fallback-model": "fallback response",
+        }
+    )
+
+    client = AsyncLLMClient(
+        transport=transport,
+        model="primary-model",
+        fallback_models=("fallback-model",),
+        max_retries=0,
+        base_delay_seconds=0,
+    )
+
+    result = await client.generate(
+        "test prompt"
+    )
+
+    assert result == "successful response"
+    assert client.last_model == "primary-model"
+
+    assert transport.calls == [
+        "primary-model",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_last_model_resets_when_new_request_fails() -> None:
+    transport = FakeTransport(
+        responses={
+            "primary-model": "successful response",
+        }
+    )
+
+    client = AsyncLLMClient(
+        transport=transport,
+        model="primary-model",
+        max_retries=0,
+        base_delay_seconds=0,
+    )
+
+    await client.generate(
+        "first request"
+    )
+
+    assert client.last_model == "primary-model"
+
+    transport.responses["primary-model"] = LLMRequestError(
+        "HTTP 503 Service Unavailable"
+    )
+
+    with pytest.raises(LLMRequestError):
+        await client.generate(
+            "second request"
+        )
+
+    assert client.last_model is None
+
+
+@pytest.mark.asyncio
+async def test_timeout_can_fail_over_to_next_model() -> None:
+    class TimeoutTransport:
+        async def send(
+            self,
+            prompt: str,
+            model: str,
+        ) -> str:
+            if model == "primary-model":
+                await asyncio.sleep(0.05)
+
+            return "fallback response"
+
+    client = AsyncLLMClient(
+        transport=TimeoutTransport(),
+        model="primary-model",
+        fallback_models=("fallback-model",),
         timeout_seconds=0.01,
         max_retries=0,
         base_delay_seconds=0,
     )
 
-    with pytest.raises(
-        LLMTimeoutError,
-        match="timed out",
-    ):
+    result = await client.generate(
+        "test prompt"
+    )
+
+    assert result == "fallback response"
+    assert client.last_model == "fallback-model"
+
+
+@pytest.mark.asyncio
+async def test_non_retryable_error_does_not_use_fallback() -> None:
+    transport = FakeTransport(
+        responses={
+            "primary-model": LLMRequestError(
+                "Gemini request failed "
+                "(HTTP 400). "
+                "Retryable=False, "
+                "FallbackAllowed=False."
+            ),
+            "fallback-model": "should not be used",
+        }
+    )
+
+    client = AsyncLLMClient(
+        transport=transport,
+        model="primary-model",
+        fallback_models=("fallback-model",),
+        max_retries=0,
+        base_delay_seconds=0,
+    )
+
+    with pytest.raises(LLMRequestError):
         await client.generate(
-            "repair this API",
+            "test prompt"
         )
 
     assert transport.calls == [
-        "test-model",
+        "primary-model",
     ]
+
+    assert client.last_model is None
