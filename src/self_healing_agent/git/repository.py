@@ -172,6 +172,128 @@ class GitRepository:
 
         return branch_name
 
+    async def commit_changes(
+        self,
+        files: list[str],
+        message: str,
+    ) -> str:
+        """Stage specific files and create a Git commit."""
+
+        if not await self.is_repository():
+            raise GitRepositoryError(
+                "Configured path is not a Git repository"
+            )
+
+        if not files:
+            raise ValueError(
+                "At least one file must be provided"
+            )
+
+        normalized_files = self._validate_commit_files(
+            files,
+        )
+
+        normalized_message = message.strip()
+
+        if not normalized_message:
+            raise ValueError(
+                "Commit message cannot be empty"
+            )
+
+        add_result = await self._run_git(
+            "add",
+            "--",
+            *normalized_files,
+        )
+
+        if not add_result.succeeded:
+            raise GitRepositoryError(
+                self._format_error(
+                    "Unable to stage Git files",
+                    add_result,
+                )
+            )
+
+        commit_result = await self._run_git(
+            "commit",
+            "-m",
+            normalized_message,
+        )
+
+        if not commit_result.succeeded:
+            raise GitRepositoryError(
+                self._format_error(
+                    "Unable to create Git commit",
+                    commit_result,
+                )
+            )
+
+        commit_sha_result = await self._run_git(
+            "rev-parse",
+            "HEAD",
+        )
+
+        if not commit_sha_result.succeeded:
+            raise GitRepositoryError(
+                self._format_error(
+                    "Unable to determine Git commit SHA",
+                    commit_sha_result,
+                )
+            )
+
+        commit_sha = commit_sha_result.stdout.strip()
+
+        if not commit_sha:
+            raise GitRepositoryError(
+                "Git commit succeeded but no commit SHA was returned"
+            )
+
+        return commit_sha
+
+    def _validate_commit_files(
+        self,
+        files: list[str],
+    ) -> list[str]:
+        """Validate file paths supplied for a Git commit."""
+
+        normalized_files: list[str] = []
+
+        for file_path in files:
+            normalized_path = file_path.strip()
+
+            if not normalized_path:
+                raise ValueError(
+                    "Commit file path cannot be empty"
+                )
+
+            path = Path(normalized_path)
+
+            if path.is_absolute():
+                raise ValueError(
+                    "Commit file paths must be relative"
+                )
+
+            if any(
+                part == ".."
+                for part in path.parts
+            ):
+                raise ValueError(
+                    "Commit file paths cannot contain '..'"
+                )
+
+            normalized_files.append(
+                path.as_posix(),
+            )
+
+        if len(set(normalized_files)) != len(
+            normalized_files
+        ):
+            raise ValueError(
+                "Commit file paths must be unique"
+            )
+
+        return normalized_files
+
     async def _run_git(
         self,
         *arguments: str,
