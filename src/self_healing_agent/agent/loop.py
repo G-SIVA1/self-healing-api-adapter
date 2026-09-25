@@ -22,6 +22,10 @@ from self_healing_agent.agent.history_store import (
 )
 from self_healing_agent.agent.reasoner import RepairReasoner
 from self_healing_agent.agent.state import AgentState
+from self_healing_agent.git.repair_manager import (
+    GitRepairManager,
+    RepairCommit,
+)
 from self_healing_agent.sandbox.repair_executor import (
     RepairExecutionResult,
     RepairExecutor,
@@ -36,6 +40,7 @@ class AgentLoopResult:
     execution_results: list[RepairExecutionResult]
     final_decision: DecisionAction
     history: RepairHistory
+    git_commit: RepairCommit | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -45,7 +50,7 @@ class AgentLoopResult:
 
 
 class SelfCorrectionLoop:
-    """Coordinate reasoning, patching, validation, and repair history."""
+    """Coordinate reasoning, patching, validation, history, and Git."""
 
     def __init__(
         self,
@@ -57,12 +62,14 @@ class SelfCorrectionLoop:
         history: RepairHistory | None = None,
         history_store: RepairHistoryStore | None = None,
         history_retriever: RepairHistoryRetriever | None = None,
+        git_repair_manager: GitRepairManager | None = None,
     ) -> None:
         self._architect = architect
         self._repair_executor = repair_executor
         self._reasoner = reasoner
         self._context_builder = context_builder
         self._decision_engine = decision_engine
+        self._git_repair_manager = git_repair_manager
 
         self._history = (
             history
@@ -103,13 +110,28 @@ class SelfCorrectionLoop:
 
         return self._history_retriever
 
+    @property
+    def git_repair_manager(
+        self,
+    ) -> GitRepairManager | None:
+        """Return the configured Git repair manager."""
+
+        return self._git_repair_manager
+
     async def run(
         self,
         state: AgentState,
         workspace: Path,
         validation_command: list[str],
+        git_service_name: str | None = None,
+        git_api_call: str | None = None,
     ) -> AgentLoopResult:
-        """Execute the self-correction loop."""
+        """
+        Execute the self-correction loop.
+
+        When a GitRepairManager is configured and Git metadata is supplied,
+        a verified successful repair is committed automatically.
+        """
 
         if not workspace.exists():
             raise ValueError(
@@ -126,6 +148,7 @@ class SelfCorrectionLoop:
         ] = []
 
         final_decision = DecisionAction.STOP
+        git_commit: RepairCommit | None = None
 
         while state.can_continue():
             current_source_code = (
@@ -182,6 +205,14 @@ class SelfCorrectionLoop:
 
         if state.repair_complete:
             final_decision = DecisionAction.STOP
+
+            git_commit = await self._commit_verified_repair(
+                state=state,
+                workspace=workspace,
+                service_name=git_service_name,
+                api_call=git_api_call,
+            )
+
         elif not state.can_continue():
             final_decision = DecisionAction.ESCALATE
 
@@ -190,7 +221,97 @@ class SelfCorrectionLoop:
             execution_results=execution_results,
             final_decision=final_decision,
             history=self._history,
+            git_commit=git_commit,
         )
+
+    async def _commit_verified_repair(
+        self,
+        state: AgentState,
+        workspace: Path,
+        service_name: str | None,
+        api_call: str | None,
+    ) -> RepairCommit | None:
+        """
+        Commit a successfully validated repair when Git integration
+        has been configured.
+
+        Git integration is skipped when no manager or Git metadata
+        has been supplied.
+        """
+
+        if self._git_repair_manager is None:
+            return None
+
+        if service_name is None:
+            return None
+
+        if api_call is None:
+            return None
+
+        target_file = state.error_event.file_path
+
+        if not target_file:
+            raise RuntimeError(
+                "Cannot commit verified repair without a target file"
+            )
+
+        relative_file = self._relative_git_file_path(
+            target_file=target_file,
+            workspace=workspace,
+        )
+
+        return await (
+            self._git_repair_manager.commit_verified_repair(
+                service_name=service_name,
+                api_call=api_call,
+                files=[relative_file],
+                commit_message=(
+                    "Fix "
+                    f"{service_name} "
+                    f"{api_call} compatibility"
+                ),
+                test_passed=state.test_passed,
+                iteration=state.iteration,
+            )
+        )
+
+    @staticmethod
+    def _relative_git_file_path(
+        target_file: str,
+        workspace: Path,
+    ) -> str:
+        """Convert a target file path into a safe Git-relative path."""
+
+        target_path = Path(target_file)
+
+        if not target_path.is_absolute():
+            relative_path = target_path
+        else:
+            try:
+                relative_path = target_path.relative_to(
+                    workspace
+                )
+            except ValueError as exc:
+                raise RuntimeError(
+                    "Repair target file is outside the workspace"
+                ) from exc
+
+        normalized = (
+            relative_path.as_posix()
+            .strip()
+        )
+
+        if not normalized:
+            raise RuntimeError(
+                "Repair target file path is empty"
+            )
+
+        if normalized == ".":
+            raise RuntimeError(
+                "Repair target file path is invalid"
+            )
+
+        return normalized
 
     def _retrieve_history(
         self,
