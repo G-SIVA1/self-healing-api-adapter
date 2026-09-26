@@ -16,9 +16,10 @@ class Settings:
     llm_model: str
     llm_timeout_seconds: float
     llm_max_retries: int
-    llm_fallback_models: tuple[str, ...] = field(
-        default_factory=tuple,
-    )
+    llm_fallback_models: tuple[str, ...]
+
+    github_token: str | None = None
+    github_repository: str | None = None
 
     @classmethod
     def from_environment(cls) -> Settings:
@@ -47,6 +48,16 @@ class Settings:
         retries_raw = os.getenv(
             "LLM_MAX_RETRIES",
             "2",
+        ).strip()
+
+        github_token_raw = os.getenv(
+            "GITHUB_TOKEN",
+            "",
+        ).strip()
+
+        github_repository_raw = os.getenv(
+            "GITHUB_REPOSITORY",
+            "",
         ).strip()
 
         if not provider:
@@ -95,10 +106,41 @@ class Settings:
                 "LLM_MAX_RETRIES cannot be negative"
             )
 
+        github_token: str | None = (
+            github_token_raw
+            if github_token_raw
+            else None
+        )
+
+        github_repository: str | None = (
+            github_repository_raw
+            if github_repository_raw
+            else None
+        )
+
+        if github_repository is not None:
+            repository_parts = github_repository.split("/")
+
+            if (
+                len(repository_parts) != 2
+                or not repository_parts[0].strip()
+                or not repository_parts[1].strip()
+            ):
+                raise SettingsError(
+                    "GITHUB_REPOSITORY must use the format 'owner/repository'"
+                )
+
+            github_repository = (
+                f"{repository_parts[0].strip()}/"
+                f"{repository_parts[1].strip()}"
+            )
+
         return cls(
             llm_provider=provider,
             llm_model=model,
             llm_timeout_seconds=timeout_seconds,
             llm_max_retries=max_retries,
             llm_fallback_models=fallback_models,
+            github_token=github_token,
+            github_repository=github_repository,
         )

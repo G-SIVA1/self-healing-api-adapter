@@ -88,11 +88,52 @@ def initialize_git_repository(
     )
 
 
+def configure_local_git_remote(
+    repository_path: Path,
+) -> Path:
+    remote_path = (
+        repository_path.parent
+        / f"{repository_path.name}-remote.git"
+    )
+
+    subprocess.run(
+        [
+            "git",
+            "init",
+            "--bare",
+            remote_path,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    subprocess.run(
+        [
+            "git",
+            "remote",
+            "add",
+            "origin",
+            str(remote_path),
+        ],
+        cwd=repository_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    return remote_path
+
+
 @pytest.mark.asyncio
 async def test_verified_repair_becomes_git_commit(
     tmp_path: Path,
 ) -> None:
     initialize_git_repository(
+        tmp_path,
+    )
+
+    configure_local_git_remote(
         tmp_path,
     )
 

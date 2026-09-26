@@ -26,46 +26,50 @@ from self_healing_agent.sandbox.security import (
 )
 
 
+def run_git_command(
+    repository_path: Path,
+    arguments: list[str],
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "git",
+            *arguments,
+        ],
+        cwd=repository_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 def initialize_git_repository(
     repository_path: Path,
 ) -> None:
-    subprocess.run(
+    run_git_command(
+        repository_path,
         [
-            "git",
             "init",
             "-b",
             "main",
         ],
-        cwd=repository_path,
-        check=True,
-        capture_output=True,
-        text=True,
     )
 
-    subprocess.run(
+    run_git_command(
+        repository_path,
         [
-            "git",
             "config",
             "user.name",
             "Test User",
         ],
-        cwd=repository_path,
-        check=True,
-        capture_output=True,
-        text=True,
     )
 
-    subprocess.run(
+    run_git_command(
+        repository_path,
         [
-            "git",
             "config",
             "user.email",
             "test@example.com",
         ],
-        cwd=repository_path,
-        check=True,
-        capture_output=True,
-        text=True,
     )
 
     readme_path = repository_path / "README.md"
@@ -75,11 +79,108 @@ def initialize_git_repository(
         encoding="utf-8",
     )
 
-    subprocess.run(
+    run_git_command(
+        repository_path,
         [
-            "git",
             "add",
             "README.md",
+        ],
+    )
+
+    run_git_command(
+        repository_path,
+        [
+            "commit",
+            "-m",
+            "Initial commit",
+        ],
+    )
+
+
+def configure_local_git_remote(
+    repository_path: Path,
+) -> Path:
+    remote_path = (
+        repository_path.parent
+        / f"{repository_path.name}-origin.git"
+    ).resolve()
+
+    if remote_path.exists():
+        subprocess.run(
+            [
+                "git",
+                "init",
+                "--bare",
+                str(remote_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    else:
+        subprocess.run(
+            [
+                "git",
+                "init",
+                "--bare",
+                str(remote_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    bare_check = subprocess.run(
+        [
+            "git",
+            "rev-parse",
+            "--is-bare-repository",
+        ],
+        cwd=remote_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert bare_check.stdout.strip() == "true"
+
+    remote_url = remote_path.as_uri()
+
+    run_git_command(
+        repository_path,
+        [
+            "remote",
+            "remove",
+            "origin",
+        ],
+    ) if subprocess.run(
+        [
+            "git",
+            "remote",
+            "get-url",
+            "origin",
+        ],
+        cwd=repository_path,
+        capture_output=True,
+        text=True,
+    ).returncode == 0 else None
+
+    run_git_command(
+        repository_path,
+        [
+            "remote",
+            "add",
+            "origin",
+            remote_url,
+        ],
+    )
+
+    configured_remote = subprocess.run(
+        [
+            "git",
+            "remote",
+            "get-url",
+            "origin",
         ],
         cwd=repository_path,
         check=True,
@@ -87,18 +188,9 @@ def initialize_git_repository(
         text=True,
     )
 
-    subprocess.run(
-        [
-            "git",
-            "commit",
-            "-m",
-            "Initial commit",
-        ],
-        cwd=repository_path,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    assert configured_remote.stdout.strip() == remote_url
+
+    return remote_path
 
 
 def create_stripe_source(
@@ -127,29 +219,21 @@ def create_stripe_source(
         encoding="utf-8",
     )
 
-    subprocess.run(
+    run_git_command(
+        repository_path,
         [
-            "git",
             "add",
             "examples/stripe_client.py",
         ],
-        cwd=repository_path,
-        check=True,
-        capture_output=True,
-        text=True,
     )
 
-    subprocess.run(
+    run_git_command(
+        repository_path,
         [
-            "git",
             "commit",
             "-m",
             "Add broken Stripe client",
         ],
-        cwd=repository_path,
-        check=True,
-        capture_output=True,
-        text=True,
     )
 
     return original_code
@@ -279,7 +363,13 @@ def failing_validation_command() -> list[str]:
 async def test_self_correction_loop_commits_verified_repair(
     tmp_path: Path,
 ) -> None:
-    initialize_git_repository(tmp_path)
+    initialize_git_repository(
+        tmp_path,
+    )
+
+    configure_local_git_remote(
+        tmp_path,
+    )
 
     original_code = create_stripe_source(
         tmp_path,
@@ -353,7 +443,9 @@ async def test_self_correction_loop_commits_verified_repair(
 async def test_failed_validation_does_not_create_git_commit(
     tmp_path: Path,
 ) -> None:
-    initialize_git_repository(tmp_path)
+    initialize_git_repository(
+        tmp_path,
+    )
 
     original_code = create_stripe_source(
         tmp_path,

@@ -25,6 +25,7 @@ from self_healing_agent.agent.state import AgentState
 from self_healing_agent.git.repair_manager import (
     GitRepairManager,
     RepairCommit,
+    RepairPullRequest,
 )
 from self_healing_agent.sandbox.repair_executor import (
     RepairExecutionResult,
@@ -41,6 +42,7 @@ class AgentLoopResult:
     final_decision: DecisionAction
     history: RepairHistory
     git_commit: RepairCommit | None = None
+    git_pull_request: RepairPullRequest | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -50,7 +52,7 @@ class AgentLoopResult:
 
 
 class SelfCorrectionLoop:
-    """Coordinate reasoning, patching, validation, history, and Git."""
+    """Coordinate reasoning, patching, validation, history, Git, and PRs."""
 
     def __init__(
         self,
@@ -125,12 +127,16 @@ class SelfCorrectionLoop:
         validation_command: list[str],
         git_service_name: str | None = None,
         git_api_call: str | None = None,
+        git_repository: str | None = None,
+        git_target_branch: str | None = None,
+        git_pull_request_title: str | None = None,
+        git_pull_request_description: str = "",
     ) -> AgentLoopResult:
         """
         Execute the self-correction loop.
 
-        When a GitRepairManager is configured and Git metadata is supplied,
-        a verified successful repair is committed automatically.
+        A verified repair can optionally be committed to Git and then
+        submitted as a pull request using the same RepairCommit.
         """
 
         if not workspace.exists():
@@ -148,7 +154,10 @@ class SelfCorrectionLoop:
         ] = []
 
         final_decision = DecisionAction.STOP
+
         git_commit: RepairCommit | None = None
+
+        git_pull_request: RepairPullRequest | None = None
 
         while state.can_continue():
             current_source_code = (
@@ -206,12 +215,29 @@ class SelfCorrectionLoop:
         if state.repair_complete:
             final_decision = DecisionAction.STOP
 
-            git_commit = await self._commit_verified_repair(
-                state=state,
-                workspace=workspace,
-                service_name=git_service_name,
-                api_call=git_api_call,
+            git_commit = (
+                await self._commit_verified_repair(
+                    state=state,
+                    workspace=workspace,
+                    service_name=git_service_name,
+                    api_call=git_api_call,
+                )
             )
+
+            if (
+                git_commit is not None
+                and git_repository is not None
+                and git_target_branch is not None
+            ):
+                git_pull_request = (
+                    await self._create_pull_request(
+                        commit=git_commit,
+                        repository=git_repository,
+                        target_branch=git_target_branch,
+                        title=git_pull_request_title,
+                        description=git_pull_request_description,
+                    )
+                )
 
         elif not state.can_continue():
             final_decision = DecisionAction.ESCALATE
@@ -222,6 +248,7 @@ class SelfCorrectionLoop:
             final_decision=final_decision,
             history=self._history,
             git_commit=git_commit,
+            git_pull_request=git_pull_request,
         )
 
     async def _commit_verified_repair(
@@ -272,6 +299,35 @@ class SelfCorrectionLoop:
                 ),
                 test_passed=state.test_passed,
                 iteration=state.iteration,
+            )
+        )
+
+    async def _create_pull_request(
+        self,
+        commit: RepairCommit,
+        repository: str,
+        target_branch: str,
+        title: str | None,
+        description: str,
+    ) -> RepairPullRequest:
+        """
+        Create a pull request for an existing repair commit.
+
+        This deliberately does not create another Git commit.
+        """
+
+        if self._git_repair_manager is None:
+            raise RuntimeError(
+                "Cannot create pull request without a Git repair manager"
+            )
+
+        return await (
+            self._git_repair_manager.create_pull_request_for_commit(
+                commit=commit,
+                repository=repository,
+                target_branch=target_branch,
+                title=title,
+                description=description,
             )
         )
 
