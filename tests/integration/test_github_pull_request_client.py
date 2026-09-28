@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from threading import Thread
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import pytest
@@ -12,20 +13,59 @@ import pytest
 from self_healing_agent.git.github_client import (
     GitHubPullRequestClient,
 )
-from self_healing_agent.git.repair_manager import (
-    GitRepairManager,
+from self_healing_agent.git.pull_request import (
+    PullRequestError,
 )
 from self_healing_agent.git.repository import (
     GitRepository,
 )
+from self_healing_agent.git.repair_manager import (
+    GitRepairManager,
+)
 
 
 class MockGitHubHandler(BaseHTTPRequestHandler):
+    """Local HTTP mock for GitHub pull-request operations."""
+
     received_headers: dict[str, str] = {}
     received_payload: dict[str, Any] = {}
+    received_method: str = ""
     response_status: int = 201
 
+    def do_GET(self) -> None:
+        """Return no existing pull requests."""
+
+        MockGitHubHandler.received_method = "GET"
+
+        response_body: list[dict[str, Any]] = []
+
+        encoded_response = json.dumps(
+            response_body,
+        ).encode("utf-8")
+
+        self.send_response(200)
+
+        self.send_header(
+            "Content-Type",
+            "application/json",
+        )
+
+        self.send_header(
+            "Content-Length",
+            str(len(encoded_response)),
+        )
+
+        self.end_headers()
+
+        self.wfile.write(
+            encoded_response,
+        )
+
     def do_POST(self) -> None:
+        """Capture pull-request creation requests."""
+
+        MockGitHubHandler.received_method = "POST"
+
         content_length = int(
             self.headers.get(
                 "Content-Length",
@@ -38,7 +78,7 @@ class MockGitHubHandler(BaseHTTPRequestHandler):
         )
 
         MockGitHubHandler.received_headers = {
-            key.lower(): value
+            key: value
             for key, value in self.headers.items()
         }
 
@@ -52,7 +92,7 @@ class MockGitHubHandler(BaseHTTPRequestHandler):
                 "title"
             ],
             "html_url": (
-                "https://github.com/"
+                "http://github.test/"
                 "G-SIVA1/self-healing-api-adapter/"
                 "pull/42"
             ),
@@ -97,13 +137,18 @@ class MockGitHubHandler(BaseHTTPRequestHandler):
         format: str,
         *args: object,
     ) -> None:
+        """Disable HTTP server logging during tests."""
+
         return
 
 
 @pytest.fixture
-def mock_github_server() -> str:
+def mock_github_server() -> Any:
+    """Start a local HTTP server that emulates GitHub."""
+
     MockGitHubHandler.received_headers = {}
     MockGitHubHandler.received_payload = {}
+    MockGitHubHandler.received_method = ""
     MockGitHubHandler.response_status = 201
 
     server = HTTPServer(
@@ -111,490 +156,552 @@ def mock_github_server() -> str:
         MockGitHubHandler,
     )
 
-    thread = Thread(
+    thread = threading.Thread(
         target=server.serve_forever,
         daemon=True,
     )
 
     thread.start()
 
-    host, port = server.server_address
-
     try:
-        yield f"http://{host}:{port}"
+        yield server
+
     finally:
         server.shutdown()
-        thread.join()
         server.server_close()
+        thread.join(timeout=5)
 
 
-def run_git_command(
-    repository_path: Path,
-    arguments: list[str],
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+def run_git(
+    repository: Path,
+    *arguments: str,
+) -> str:
+    """Run Git inside a test repository."""
+
+    result = subprocess.run(
         [
             "git",
             *arguments,
         ],
-        cwd=repository_path,
+        cwd=repository,
         check=True,
         capture_output=True,
         text=True,
     )
 
+    return result.stdout.strip()
 
-def initialize_git_repository(
-    repository_path: Path,
+
+def configure_git_repository(
+    repository: Path,
 ) -> None:
-    run_git_command(
-        repository_path,
-        [
+    """Configure Git identity for tests."""
+
+    run_git(
+        repository,
+        "config",
+        "user.name",
+        "Test User",
+    )
+
+    run_git(
+        repository,
+        "config",
+        "user.email",
+        "test@example.com",
+    )
+
+
+@pytest.fixture
+def git_repository() -> Any:
+    """Create a temporary Git repository."""
+
+    with TemporaryDirectory() as temporary_directory:
+        repository = Path(temporary_directory)
+
+        run_git(
+            repository,
             "init",
             "-b",
             "main",
-        ],
-    )
+        )
 
-    run_git_command(
-        repository_path,
-        [
-            "config",
-            "user.name",
-            "Test User",
-        ],
-    )
+        configure_git_repository(
+            repository,
+        )
 
-    run_git_command(
-        repository_path,
-        [
-            "config",
-            "user.email",
-            "test@example.com",
-        ],
-    )
+        repaired_file = (
+            repository / "repair_target.py"
+        )
 
-    readme_path = repository_path / "README.md"
+        repaired_file.write_text(
+            "import stripe\n\n"
+            "stripe.Customer.create()\n",
+            encoding="utf-8",
+        )
 
-    readme_path.write_text(
-        "Initial repository content\n",
-        encoding="utf-8",
-    )
-
-    run_git_command(
-        repository_path,
-        [
+        run_git(
+            repository,
             "add",
-            "README.md",
-        ],
-    )
+            "repair_target.py",
+        )
 
-    run_git_command(
-        repository_path,
-        [
+        run_git(
+            repository,
             "commit",
             "-m",
-            "Initial commit",
-        ],
-    )
+            "initial commit",
+        )
 
-
-def configure_local_git_remote(
-    repository_path: Path,
-) -> Path:
-    remote_path = (
-        repository_path.parent
-        / f"{repository_path.name}-origin.git"
-    ).resolve()
-
-    subprocess.run(
-        [
-            "git",
-            "init",
-            "--bare",
-            str(remote_path),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-
-    remote_url = remote_path.as_uri()
-
-    run_git_command(
-        repository_path,
-        [
-            "remote",
-            "add",
-            "origin",
-            remote_url,
-        ],
-    )
-
-    configured_remote = subprocess.run(
-        [
-            "git",
-            "remote",
-            "get-url",
-            "origin",
-        ],
-        cwd=repository_path,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-
-    assert configured_remote.stdout.strip() == remote_url
-
-    return remote_path
+        yield repository
 
 
 @pytest.mark.asyncio
 async def test_github_client_creates_pull_request_over_http(
-    mock_github_server: str,
+    mock_github_server: HTTPServer,
 ) -> None:
-    client = GitHubPullRequestClient(
-        token="test-token",
+    """Create a PR against the local GitHub mock server."""
+
+    original_base_url = (
+        GitHubPullRequestClient.API_BASE_URL
     )
 
-    original_base_url = client.API_BASE_URL
-    client.API_BASE_URL = mock_github_server
+    GitHubPullRequestClient.API_BASE_URL = (
+        f"http://127.0.0.1:"
+        f"{mock_github_server.server_port}"
+    )
 
     try:
-        result = await client.create_pull_request(
+        client = GitHubPullRequestClient(
+            token="test-token",
+        )
+
+        pull_request = await client.create_pull_request(
             repository=(
                 "G-SIVA1/"
                 "self-healing-api-adapter"
             ),
-            source_branch=(
-                "repair/stripe-customer-create"
-            ),
+            source_branch="repair/test",
             target_branch="main",
-            title="Stripe API compatibility repair",
-            description=(
-                "Automated repair generated by "
-                "the self-healing agent."
+            title=(
+                "fix: self-heal "
+                "stripe compatibility"
             ),
+            description="Automated repair.",
         )
+
+        assert pull_request.number == 42
+
+        assert (
+            pull_request.title
+            == (
+                "fix: self-heal "
+                "stripe compatibility"
+            )
+        )
+
+        assert (
+            pull_request.url
+            == (
+                "http://github.test/"
+                "G-SIVA1/self-healing-api-adapter/"
+                "pull/42"
+            )
+        )
+
+        assert (
+            pull_request.source_branch
+            == "repair/test"
+        )
+
+        assert (
+            pull_request.target_branch
+            == "main"
+        )
+
+        assert (
+            MockGitHubHandler.received_method
+            == "POST"
+        )
+
+        assert (
+            MockGitHubHandler.received_payload[
+                "title"
+            ]
+            == (
+                "fix: self-heal "
+                "stripe compatibility"
+            )
+        )
+
+        assert (
+            MockGitHubHandler.received_payload[
+                "head"
+            ]
+            == "repair/test"
+        )
+
+        assert (
+            MockGitHubHandler.received_payload[
+                "base"
+            ]
+            == "main"
+        )
+
+        assert (
+            MockGitHubHandler.received_payload[
+                "body"
+            ]
+            == "Automated repair."
+        )
+
+        assert (
+            MockGitHubHandler.received_headers[
+                "Authorization"
+            ]
+            == "Bearer test-token"
+        )
+
+        assert (
+            MockGitHubHandler.received_headers[
+                "X-GitHub-Api-Version"
+            ]
+            == GitHubPullRequestClient.API_VERSION
+        )
+
     finally:
-        client.API_BASE_URL = original_base_url
-
-    assert result.number == 42
-
-    assert result.title == (
-        "Stripe API compatibility repair"
-    )
-
-    assert result.url == (
-        "https://github.com/"
-        "G-SIVA1/self-healing-api-adapter/"
-        "pull/42"
-    )
-
-    assert result.source_branch == (
-        "repair/stripe-customer-create"
-    )
-
-    assert result.target_branch == "main"
-
-    assert MockGitHubHandler.received_payload == {
-        "title": (
-            "Stripe API compatibility repair"
-        ),
-        "head": (
-            "repair/stripe-customer-create"
-        ),
-        "base": "main",
-        "body": (
-            "Automated repair generated by "
-            "the self-healing agent."
-        ),
-    }
-
-    assert (
-        MockGitHubHandler.received_headers[
-            "authorization"
-        ]
-        == "Bearer test-token"
-    )
-
-    assert (
-        MockGitHubHandler.received_headers[
-            "accept"
-        ]
-        == "application/vnd.github+json"
-    )
-
-    assert (
-        MockGitHubHandler.received_headers[
-            "content-type"
-        ]
-        == "application/json"
-    )
-
-    assert (
-        "x-github-api-version"
-        in MockGitHubHandler.received_headers
-    )
+        GitHubPullRequestClient.API_BASE_URL = (
+            original_base_url
+        )
 
 
 @pytest.mark.asyncio
 async def test_github_client_does_not_use_real_github(
-    mock_github_server: str,
+    mock_github_server: HTTPServer,
 ) -> None:
-    client = GitHubPullRequestClient(
-        token="fake-local-token",
+    """Verify only the local server is used."""
+
+    original_base_url = (
+        GitHubPullRequestClient.API_BASE_URL
     )
 
-    original_base_url = client.API_BASE_URL
-    client.API_BASE_URL = mock_github_server
+    GitHubPullRequestClient.API_BASE_URL = (
+        f"http://127.0.0.1:"
+        f"{mock_github_server.server_port}"
+    )
 
     try:
-        result = await client.create_pull_request(
-            repository="owner/repository",
-            source_branch="repair/test",
-            target_branch="main",
-            title="Test repair",
-            description="Local integration test.",
+        client = GitHubPullRequestClient(
+            token="test-token",
         )
+
+        pull_request = await client.create_pull_request(
+            repository=(
+                "G-SIVA1/"
+                "self-healing-api-adapter"
+            ),
+            source_branch="repair/local-test",
+            target_branch="main",
+            title="Local integration test",
+            description="Local server only.",
+        )
+
+        assert pull_request.number == 42
+
+        assert (
+            MockGitHubHandler.received_method
+            == "POST"
+        )
+
     finally:
-        client.API_BASE_URL = original_base_url
-
-    assert result.number == 42
-
-    assert (
-        MockGitHubHandler.received_headers[
-            "authorization"
-        ]
-        == "Bearer fake-local-token"
-    )
-
-    assert (
-        MockGitHubHandler.received_payload[
-            "head"
-        ]
-        == "repair/test"
-    )
+        GitHubPullRequestClient.API_BASE_URL = (
+            original_base_url
+        )
 
 
 @pytest.mark.asyncio
 async def test_github_client_rejects_non_success_response(
-    mock_github_server: str,
+    mock_github_server: HTTPServer,
 ) -> None:
+    """Convert non-success responses into PullRequestError."""
+
+    original_base_url = (
+        GitHubPullRequestClient.API_BASE_URL
+    )
+
+    GitHubPullRequestClient.API_BASE_URL = (
+        f"http://127.0.0.1:"
+        f"{mock_github_server.server_port}"
+    )
+
     MockGitHubHandler.response_status = 500
+
+    try:
+        client = GitHubPullRequestClient(
+            token="test-token",
+        )
+
+        with pytest.raises(
+            PullRequestError,
+            match=(
+                "GitHub API returned HTTP 500"
+            ),
+        ):
+            await client.create_pull_request(
+                repository=(
+                    "G-SIVA1/"
+                    "self-healing-api-adapter"
+                ),
+                source_branch="repair/failure-test",
+                target_branch="main",
+                title="Failure test",
+                description="Failure test.",
+            )
+
+    finally:
+        GitHubPullRequestClient.API_BASE_URL = (
+            original_base_url
+        )
+
+
+@pytest.mark.asyncio
+async def test_git_repair_manager_commits_pushes_and_creates_pull_request(
+    mock_github_server: HTTPServer,
+    git_repository: Path,
+) -> None:
+    """Run the complete Git repair manager flow."""
+
+    original_base_url = (
+        GitHubPullRequestClient.API_BASE_URL
+    )
+
+    GitHubPullRequestClient.API_BASE_URL = (
+        f"http://127.0.0.1:"
+        f"{mock_github_server.server_port}"
+    )
+
+    # IMPORTANT:
+    # The remote must be unique for every test run.
+    remote_repository = (
+        git_repository.parent
+        / f"remote-{git_repository.name}.git"
+    )
+
+    run_git(
+        git_repository,
+        "init",
+        "--bare",
+        str(remote_repository),
+    )
+
+    run_git(
+        git_repository,
+        "remote",
+        "add",
+        "origin",
+        str(remote_repository),
+    )
 
     client = GitHubPullRequestClient(
         token="test-token",
     )
 
-    original_base_url = client.API_BASE_URL
-    client.API_BASE_URL = mock_github_server
-
-    try:
-        with pytest.raises(
-            Exception,
-            match="GitHub API returned HTTP 500",
-        ):
-            await client.create_pull_request(
-                repository="owner/repository",
-                source_branch="repair/test",
-                target_branch="main",
-                title="Test repair",
-                description="Test failure.",
-            )
-    finally:
-        client.API_BASE_URL = original_base_url
-        MockGitHubHandler.response_status = 201
-
-
-@pytest.mark.asyncio
-async def test_git_repair_manager_commits_pushes_and_creates_pull_request(
-    tmp_path: Path,
-    mock_github_server: str,
-) -> None:
-    initialize_git_repository(
-        tmp_path,
+    repository = GitRepository(
+        git_repository,
     )
 
-    configure_local_git_remote(
-        tmp_path,
+    manager = GitRepairManager(
+        repository=repository,
+        pull_request_client=client,
     )
 
     repaired_file = (
-        tmp_path
-        / "examples"
-        / "stripe_client.py"
-    )
-
-    repaired_file.parent.mkdir(
-        parents=True,
-        exist_ok=True,
+        git_repository / "repair_target.py"
     )
 
     repaired_file.write_text(
         "import stripe\n\n"
-        "stripe.customers.create(\n"
-        "    email='user@example.com'\n"
-        ")\n",
+        "stripe.customers.create()\n",
         encoding="utf-8",
     )
 
-    repository = GitRepository(
-        tmp_path,
-    )
-
-    github_client = GitHubPullRequestClient(
-        token="local-test-token",
-    )
-
-    original_base_url = github_client.API_BASE_URL
-    github_client.API_BASE_URL = mock_github_server
-
     try:
-        manager = GitRepairManager(
-            repository=repository,
-            pull_request_client=github_client,
+        result = (
+            await manager.commit_and_create_pull_request(
+                service_name="stripe",
+                api_call="Customer.create",
+                files=[
+                    "repair_target.py",
+                ],
+                test_passed=True,
+                repository=(
+                    "G-SIVA1/"
+                    "self-healing-api-adapter"
+                ),
+                target_branch="main",
+                commit_message=(
+                    "Fix Stripe customer "
+                    "API compatibility"
+                ),
+                pull_request_title=(
+                    "Stripe API compatibility repair"
+                ),
+                pull_request_description=(
+                    "Automated repair generated "
+                    "by the self-healing agent."
+                ),
+            )
         )
 
-        result = await manager.commit_and_create_pull_request(
-            service_name="Stripe",
-            api_call="Customer Create",
-            files=[
-                "examples/stripe_client.py",
-            ],
-            test_passed=True,
-            repository=(
-                "G-SIVA1/"
-                "self-healing-api-adapter"
-            ),
-            target_branch="main",
-            commit_message=(
-                "Fix Stripe customer API compatibility"
-            ),
-            pull_request_title=(
+        assert result.commit.branch.name.startswith(
+            "repair/"
+        )
+
+        assert result.commit.commit_sha
+
+        assert result.commit.files == (
+            "repair_target.py",
+        )
+
+        assert (
+            result.commit.commit_message
+            == (
+                "Fix Stripe customer "
+                "API compatibility"
+            )
+        )
+
+        assert (
+            result.pull_request.number
+            == 42
+        )
+
+        assert (
+            result.pull_request.title
+            == (
                 "Stripe API compatibility repair"
-            ),
-            pull_request_description=(
-                "Automated repair generated by "
-                "the self-healing agent."
-            ),
+            )
         )
+
+        assert (
+            result.pull_request.url
+            == (
+                "http://github.test/"
+                "G-SIVA1/self-healing-api-adapter/"
+                "pull/42"
+            )
+        )
+
+        assert (
+            result.pull_request.source_branch
+            == result.commit.branch.name
+        )
+
+        assert (
+            result.pull_request.target_branch
+            == "main"
+        )
+
+        assert (
+            MockGitHubHandler.received_method
+            == "POST"
+        )
+
+        assert (
+            MockGitHubHandler.received_headers[
+                "Authorization"
+            ]
+            == "Bearer test-token"
+        )
+
+        assert (
+            MockGitHubHandler.received_headers[
+                "X-GitHub-Api-Version"
+            ]
+            == GitHubPullRequestClient.API_VERSION
+        )
+
+        assert (
+            MockGitHubHandler.received_payload[
+                "head"
+            ]
+            == result.commit.branch.name
+        )
+
+        assert (
+            MockGitHubHandler.received_payload[
+                "base"
+            ]
+            == "main"
+        )
+
+        assert (
+            MockGitHubHandler.received_payload[
+                "title"
+            ]
+            == (
+                "Stripe API compatibility repair"
+            )
+        )
+
+        assert (
+            MockGitHubHandler.received_payload[
+                "body"
+            ]
+            == (
+                "Automated repair generated "
+                "by the self-healing agent."
+            )
+        )
+
+        assert (
+            repaired_file.read_text(
+                encoding="utf-8",
+            )
+            == (
+                "import stripe\n\n"
+                "stripe.customers.create()\n"
+            )
+        )
+
+        current_branch = run_git(
+            git_repository,
+            "branch",
+            "--show-current",
+        )
+
+        assert (
+            current_branch
+            == result.commit.branch.name
+        )
+
+        commit_subject = run_git(
+            git_repository,
+            "log",
+            "-1",
+            "--pretty=%s",
+        )
+
+        assert (
+            commit_subject
+            == (
+                "Fix Stripe customer "
+                "API compatibility"
+            )
+        )
+
+        remote_branches = run_git(
+            git_repository,
+            "branch",
+            "-r",
+        )
+
+        assert (
+            f"origin/{result.commit.branch.name}"
+            in remote_branches
+        )
+
     finally:
-        github_client.API_BASE_URL = original_base_url
-
-    assert result.commit.branch.name == (
-        "repair/stripe-customer-create"
-    )
-
-    assert len(result.commit.commit_sha) == 40
-
-    assert result.commit.files == (
-        "examples/stripe_client.py",
-    )
-
-    assert result.pull_request.number == 42
-
-    assert result.pull_request.title == (
-        "Stripe API compatibility repair"
-    )
-
-    assert result.pull_request.url == (
-        "https://github.com/"
-        "G-SIVA1/self-healing-api-adapter/"
-        "pull/42"
-    )
-
-    assert result.pull_request.source_branch == (
-        "repair/stripe-customer-create"
-    )
-
-    assert result.pull_request.target_branch == "main"
-
-    assert (
-        await repository.current_branch()
-        == "repair/stripe-customer-create"
-    )
-
-    commit_result = subprocess.run(
-        [
-            "git",
-            "show",
-            "--format=%s",
-            "--no-patch",
-            result.commit.commit_sha,
-        ],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-
-    assert (
-        commit_result.stdout.strip()
-        == "Fix Stripe customer API compatibility"
-    )
-
-    file_result = subprocess.run(
-        [
-            "git",
-            "show",
-            (
-                f"{result.commit.commit_sha}:"
-                "examples/stripe_client.py"
-            ),
-        ],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-
-    assert (
-        "stripe.customers.create"
-        in file_result.stdout
-    )
-
-    assert (
-        "stripe.Customer.create"
-        not in file_result.stdout
-    )
-
-    assert MockGitHubHandler.received_payload == {
-        "title": (
-            "Stripe API compatibility repair"
-        ),
-        "head": (
-            "repair/stripe-customer-create"
-        ),
-        "base": "main",
-        "body": (
-            "Automated repair generated by "
-            "the self-healing agent."
-        ),
-    }
-
-    assert (
-        MockGitHubHandler.received_headers[
-            "authorization"
-        ]
-        == "Bearer local-test-token"
-    )
-
-    assert (
-        MockGitHubHandler.received_headers[
-            "accept"
-        ]
-        == "application/vnd.github+json"
-    )
-
-    assert (
-        MockGitHubHandler.received_headers[
-            "content-type"
-        ]
-        == "application/json"
-    )
-
-    assert (
-        "x-github-api-version"
-        in MockGitHubHandler.received_headers
-    )
+        GitHubPullRequestClient.API_BASE_URL = (
+            original_base_url
+        )

@@ -2,21 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from self_healing_agent.git.github_client import (
-    GitHubPullRequestClient,
-)
+from self_healing_agent.git.github_client import GitHubPullRequestClient
 from self_healing_agent.git.pull_request import PullRequest
 from self_healing_agent.git.repository import GitRepository
-from self_healing_agent.git.workflow import (
-    GitRepairWorkflow,
-    RepairBranch,
-)
+from self_healing_agent.git.workflow import GitRepairWorkflow, RepairBranch
 
 
 @dataclass(frozen=True, slots=True)
 class RepairCommit:
-    """Information about a committed repair."""
-
     branch: RepairBranch
     commit_sha: str
     files: tuple[str, ...]
@@ -25,31 +18,28 @@ class RepairCommit:
 
 @dataclass(frozen=True, slots=True)
 class RepairPullRequest:
-    """Information about a created repair pull request."""
-
     commit: RepairCommit
     pull_request: PullRequest
 
 
 class GitRepairManager:
-    """Coordinate branch creation, commit, push, and pull request creation."""
-
     def __init__(
         self,
         repository: GitRepository,
         workflow: GitRepairWorkflow | None = None,
         pull_request_client: GitHubPullRequestClient | None = None,
     ) -> None:
-        self._repository = repository
-        self._workflow = workflow or GitRepairWorkflow(
-            repository,
-        )
+        self.repository = repository
+        self.workflow = workflow or GitRepairWorkflow(repository)
         self._pull_request_client = pull_request_client
 
     @property
-    def pull_request_client(
-        self,
-    ) -> GitHubPullRequestClient | None:
+    def pull_request_client(self) -> GitHubPullRequestClient:
+        if self._pull_request_client is None:
+            raise RuntimeError(
+                "GitHub pull request client is not configured"
+            )
+
         return self._pull_request_client
 
     async def commit_verified_repair(
@@ -67,24 +57,19 @@ class GitRepairManager:
                 "Repair has not passed validation"
             )
 
-        normalized_files = self._normalize_files(
-            files,
-        )
+        normalized_files = self._normalize_files(files)
 
-        changed_files = await self._repository.get_changed_files()
+        changed_files = await self.repository.get_changed_files()
 
         normalized_changed_files = {
             self._normalize_path(path)
             for path in changed_files
         }
 
-        expected_files = set(
-            normalized_files,
-        )
+        expected_files = set(normalized_files)
 
         missing_files = sorted(
-            expected_files
-            - normalized_changed_files,
+            expected_files - normalized_changed_files
         )
 
         if missing_files:
@@ -94,8 +79,7 @@ class GitRepairManager:
             )
 
         unexpected_files = sorted(
-            normalized_changed_files
-            - expected_files,
+            normalized_changed_files - expected_files
         )
 
         if unexpected_files:
@@ -104,7 +88,7 @@ class GitRepairManager:
                 + ", ".join(unexpected_files)
             )
 
-        normalized_service = self._normalize_metadata(
+        normalized_service_name = self._normalize_metadata(
             service_name,
             "service_name",
         )
@@ -114,40 +98,57 @@ class GitRepairManager:
             "api_call",
         )
 
-        message = (
+        normalized_message = (
             commit_message.strip()
-            if commit_message is not None
-            else self._generate_commit_message(
-                normalized_service,
-                normalized_api_call,
+            if isinstance(commit_message, str)
+            else (
+                "fix: self-heal "
+                f"{normalized_service_name} "
+                f"{normalized_api_call} "
+                "compatibility"
             )
         )
 
-        if not message:
+        if not normalized_message:
             raise ValueError(
                 "Commit message cannot be empty"
             )
 
-        branch = await self._workflow.prepare_repair_branch(
-            service_name=normalized_service,
+        branch = await self.workflow.prepare_repair_branch(
+            service_name=normalized_service_name,
             api_call=normalized_api_call,
             iteration=iteration,
         )
 
-        commit_sha = await self._repository.commit_changes(
+        commit_sha = await self.repository.commit_changes(
             files=normalized_files,
-            message=message,
+            message=normalized_message,
         )
 
-        await self._repository.push_branch(
-            branch.name,
-        )
+        try:
+            await self.repository.push_branch(
+                branch.name
+            )
+        except Exception as push_error:
+            try:
+                await self.repository.revert_commit(
+                    commit_sha
+                )
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    "Repair commit "
+                    f"{commit_sha} could not be pushed "
+                    "and rollback failed: "
+                    f"{rollback_error}"
+                ) from rollback_error
+
+            raise push_error
 
         return RepairCommit(
             branch=branch,
             commit_sha=commit_sha,
             files=tuple(normalized_files),
-            commit_message=message,
+            commit_message=normalized_message,
         )
 
     async def create_pull_request_for_commit(
@@ -159,19 +160,6 @@ class GitRepairManager:
         title: str | None = None,
         description: str = "",
     ) -> RepairPullRequest:
-        if self._pull_request_client is None:
-            raise RuntimeError(
-                "GitHub pull request client is not configured"
-            )
-
-        if not isinstance(
-            commit,
-            RepairCommit,
-        ):
-            raise TypeError(
-                "commit must be a RepairCommit"
-            )
-
         normalized_repository = self._normalize_metadata(
             repository,
             "repository",
@@ -184,8 +172,11 @@ class GitRepairManager:
 
         normalized_title = (
             title.strip()
-            if title is not None
-            else commit.commit_message
+            if isinstance(title, str)
+            else (
+                "Automated repair: "
+                f"{commit.commit_message}"
+            )
         )
 
         if not normalized_title:
@@ -193,21 +184,33 @@ class GitRepairManager:
                 "Pull request title cannot be empty"
             )
 
-        if not isinstance(
-            description,
-            str,
-        ):
-            raise TypeError(
-                "Pull request description must be a string"
+        normalized_description = (
+            description.strip()
+            if isinstance(description, str)
+            else ""
+        )
+
+        existing_pull_request = (
+            await self.pull_request_client.find_existing_pull_request(
+                repository=normalized_repository,
+                source_branch=commit.branch.name,
+                target_branch=normalized_target_branch,
+            )
+        )
+
+        if existing_pull_request is not None:
+            return RepairPullRequest(
+                commit=commit,
+                pull_request=existing_pull_request,
             )
 
         pull_request = (
-            await self._pull_request_client.create_pull_request(
+            await self.pull_request_client.create_pull_request(
                 repository=normalized_repository,
                 source_branch=commit.branch.name,
                 target_branch=normalized_target_branch,
                 title=normalized_title,
-                description=description,
+                description=normalized_description,
             )
         )
 
@@ -253,64 +256,58 @@ class GitRepairManager:
     ) -> list[str]:
         if not files:
             raise ValueError(
-                "At least one repair file is required"
+                "At least one repair file must be provided"
             )
 
-        normalized: list[str] = []
+        normalized_files: list[str] = []
+        seen: set[str] = set()
 
         for file_path in files:
-            if not isinstance(
-                file_path,
-                str,
-            ):
-                raise TypeError(
+            if not isinstance(file_path, str):
+                raise ValueError(
                     "Repair file paths must be strings"
                 )
 
-            path = file_path.strip()
-
-            if not path:
-                raise ValueError(
-                    "Repair file path cannot be empty"
-                )
-
-            normalized.append(
+            normalized_path = (
                 GitRepairManager._normalize_path(
-                    path,
+                    file_path
                 )
             )
 
-        if len(set(normalized)) != len(normalized):
-            raise ValueError(
-                "Repair file paths must be unique"
+            if not normalized_path:
+                raise ValueError(
+                    "Repair file paths cannot be empty"
+                )
+
+            if normalized_path in seen:
+                raise ValueError(
+                    "Repair file paths must be unique"
+                )
+
+            seen.add(normalized_path)
+            normalized_files.append(
+                normalized_path
             )
 
-        return normalized
+        return normalized_files
 
     @staticmethod
     def _normalize_path(
         path: str,
     ) -> str:
-        normalized = path.strip().replace(
-            "\\",
-            "/",
+        return (
+            path.strip()
+            .replace("\\", "/")
+            .lstrip("./")
         )
-
-        while normalized.startswith("./"):
-            normalized = normalized[2:]
-
-        return normalized
 
     @staticmethod
     def _normalize_metadata(
         value: str,
         field_name: str,
     ) -> str:
-        if not isinstance(
-            value,
-            str,
-        ):
-            raise TypeError(
+        if not isinstance(value, str):
+            raise ValueError(
                 f"{field_name} must be a string"
             )
 
@@ -322,14 +319,3 @@ class GitRepairManager:
             )
 
         return normalized
-
-    @staticmethod
-    def _generate_commit_message(
-        service_name: str,
-        api_call: str,
-    ) -> str:
-        return (
-            "fix: self-heal "
-            f"{service_name} "
-            f"{api_call.strip()} compatibility"
-        )

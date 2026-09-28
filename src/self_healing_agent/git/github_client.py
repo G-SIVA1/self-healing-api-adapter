@@ -16,7 +16,7 @@ from self_healing_agent.git.pull_request import (
 
 
 class GitHubPullRequestClient:
-    """GitHub REST API client for creating pull requests."""
+    """GitHub REST API client for locating and creating pull requests."""
 
     API_BASE_URL = "https://api.github.com"
     API_VERSION = "2026-03-10"
@@ -63,6 +63,92 @@ class GitHubPullRequestClient:
             timeout_seconds=settings.llm_timeout_seconds,
         )
 
+    async def find_existing_pull_request(
+        self,
+        repository: str,
+        source_branch: str,
+        target_branch: str,
+    ) -> PullRequest | None:
+        """Find an existing open pull request for the same branch pair."""
+
+        normalized_repository = (
+            PullRequestValidator.validate_repository(
+                repository,
+            )
+        )
+
+        normalized_source_branch = (
+            PullRequestValidator.validate_branch_name(
+                source_branch,
+                "source_branch",
+            )
+        )
+
+        normalized_target_branch = (
+            PullRequestValidator.validate_branch_name(
+                target_branch,
+                "target_branch",
+            )
+        )
+
+        owner, repo = normalized_repository.split("/", 1)
+
+        url = (
+            f"{self.API_BASE_URL}"
+            f"/repos/{owner}/{repo}/pulls"
+        )
+
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {self._token}",
+            "X-GitHub-Api-Version": self.API_VERSION,
+        }
+
+        params = {
+            "state": "open",
+            "head": (
+                f"{owner}:{normalized_source_branch}"
+            ),
+            "base": normalized_target_branch,
+        }
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=self._timeout_seconds,
+            ) as client:
+                response = await client.get(
+                    url,
+                    headers=headers,
+                    params=params,
+                )
+        except httpx.HTTPError as exc:
+            raise PullRequestError(
+                f"GitHub API request failed: {exc}"
+            ) from exc
+
+        if response.status_code != 200:
+            self._raise_api_error(response)
+
+        try:
+            response_data: Any = response.json()
+        except ValueError as exc:
+            raise PullRequestError(
+                "GitHub API returned invalid JSON"
+            ) from exc
+
+        if not isinstance(response_data, list):
+            raise PullRequestError(
+                "GitHub API pull request response "
+                "must be a JSON array"
+            )
+
+        if not response_data:
+            return None
+
+        return self._parse_pull_request(
+            response_data[0],
+        )
+
     async def create_pull_request(
         self,
         repository: str,
@@ -71,7 +157,7 @@ class GitHubPullRequestClient:
         title: str,
         description: str,
     ) -> PullRequest:
-        """Create a pull request on GitHub."""
+        """Create a new pull request on GitHub."""
 
         normalized_repository = (
             PullRequestValidator.validate_repository(
